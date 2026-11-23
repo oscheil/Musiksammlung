@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only proposed copy plan; never creates directories, copies files or writes SQLite."""
+"""Read-only copy plan with detailed name conflicts and destination checks."""
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
+import os
 from pathlib import Path, PurePosixPath
 import sqlite3
 
@@ -16,15 +17,14 @@ def safe_relative(original, root):
     if not original.startswith(prefix):
         return None
     rel = original[len(prefix):]
-    parts = PurePosixPath(rel).parts
-    if not parts or any(p in ("", ".", "..") for p in parts) or rel.startswith("/"):
+    if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in rel.split("/")):
         return None
-    return PurePosixPath(*parts)
+    return PurePosixPath(rel)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--database", type=Path, default=Path.home() / "Musiksammlung_work/musiksammlung.sqlite")
-    ap.add_argument("--examples", type=int, default=12)
+    ap.add_argument("--examples", type=int, default=5)
     args = ap.parse_args()
     con = sqlite3.connect("file:" + str(args.database.resolve()) + "?mode=ro", uri=True)
     try:
@@ -34,62 +34,100 @@ def main():
         target = con.execute("SELECT root_path FROM collections WHERE role='production'").fetchone()
         if target is None:
             raise SystemExit("Keine Produktions-Collection in der Datenbank")
-        target_root = target[0]
-        rows = con.execute("""SELECT a.id,a.sha256,o.collection_id,o.original_path
-            FROM audio_files a JOIN file_origins o ON o.audio_file_id=a.id
-            ORDER BY a.id,o.id""")
-        grouped = {}
-        for file_id, sha, cid, path in rows:
+        target_root = Path(target[0])
+        grouped = defaultdict(list)
+        hashes = {}
+        invalid = []
+        for file_id, sha, cid, path in con.execute("""SELECT a.id,a.sha256,o.collection_id,o.original_path
+                FROM audio_files a JOIN file_origins o ON o.audio_file_id=a.id ORDER BY a.id,o.id"""):
+            hashes[file_id] = sha
             rel = safe_relative(path, roots[cid])
-            if rel is not None:
-                grouped.setdefault(file_id, (sha, []))[1].append((cid, path, rel))
-        used = {}
-        counts = Counter()
-        samples = []
-        errors = []
-        for file_id, (sha, origins) in sorted(grouped.items()):
-            # Prefer DATENSICHV; preserve the source-relative original tree.
+            if rel is None:
+                invalid.append((sha, path))
+            else:
+                grouped[file_id].append((cid, path, rel))
+        selected = []
+        problems = []
+        for file_id, origins in sorted(grouped.items()):
             origins.sort(key=lambda x: (names[x[0]] == "ds_musik", names[x[0]], str(x[2])))
             source = next(((cid, path, rel) for cid, path, rel in origins if Path(current_path(path)).is_file()), None)
             if source is None:
-                errors.append((sha, "Keine erreichbare Quelldatei"))
-                continue
-            cid, path, rel = source
+                problems.append((hashes[file_id], "Keine erreichbare Quelle"))
+            else:
+                selected.append((hashes[file_id], *source))
+        reserved = {str(rel).casefold() for sha, cid, path, rel in selected}
+        used = {}
+        planned = []
+        conflicts = []
+        existing = []
+        for sha, cid, source, rel in selected:
+            key = str(rel).casefold()
             candidate = rel
-            key = str(candidate).casefold()
-            if key in used and used[key] != sha:
-                counts["name_conflicts"] += 1
-                # Suffix before extension, deterministic and independent of traversal order.
-                base = rel.stem
-                ext = rel.suffix
-                candidate = rel.with_name(f"{base}--{sha[:12]}{ext}")
-                key = str(candidate).casefold()
-                if key in used and used[key] != sha:
-                    candidate = rel.with_name(f"{base}--{sha}{ext}")
-                    key = str(candidate).casefold()
-            if key in used and used[key] != sha:
-                errors.append((sha, "Zielpfad weiterhin belegt"))
-                continue
-            used[key] = sha
-            counts["planned"] += 1
-            counts["tv_sources" if names[cid] == "ds_musik" else "datensichv_sources"] += 1
-            if len(samples) < max(args.examples, 0):
-                samples.append((current_path(path), target_root.rstrip("/") + "/" + str(candidate)))
+            if key in used:
+                first = used[key]
+                for suffix in (sha[:12], sha):
+                    alt = rel.with_name(f"{rel.stem}--{suffix}{rel.suffix}")
+                    alt_key = str(alt).casefold()
+                    if alt_key not in used and alt_key not in reserved:
+                        candidate = alt
+                        key = alt_key
+                        break
+                else:
+                    problems.append((sha, "Kein freier eindeutiger Zielname"))
+                    continue
+                conflicts.append((str(rel), first, source, str(candidate)))
+            used[key] = source
+            destination = target_root / str(candidate)
+            if os.path.lexists(destination):
+                existing.append(str(destination))
+            planned.append((sha, cid, current_path(source), destination))
+        # Check planned file-vs-directory collisions, including case-folded names.
+        file_keys = {str(dest.relative_to(target_root)).casefold() for _, _, _, dest in planned}
+        hierarchy = []
+        for _, _, _, dest in planned:
+            rel = dest.relative_to(target_root)
+            for parent in list(rel.parents)[:-1]:
+                if str(parent).casefold() in file_keys:
+                    hierarchy.append(str(rel))
+                    break
+            # Existing path components must be directories, never files or symlinks.
+            for parent in [target_root, *reversed(list(dest.parents)[:-1])]:
+                if parent == Path("/"):
+                    continue
+                if os.path.lexists(parent) and (parent.is_symlink() or not parent.is_dir()):
+                    hierarchy.append(f"{dest} (vorhandene Pfadkomponente: {parent})")
+                    break
+        counts = Counter("TV" if names[cid] == "ds_musik" else "DATENSICHV" for _, cid, _, _ in planned)
         total = con.execute("SELECT COUNT(*) FROM audio_files").fetchone()[0]
-        print("NUR DRY-RUN: keine Verzeichnisse, Dateien oder Datenbankeinträge verändert")
-        print(f"Eindeutige Inhalte in SQLite: {total}")
-        print(f"Geplante Kopien: {counts['planned']}")
-        print(f"Quellen DATENSICHV: {counts['datensichv_sources']}")
-        print(f"Quellen TV: {counts['tv_sources']}")
-        print(f"Namenskonflikte mit SHA-Zusatz: {counts['name_conflicts']}")
-        print(f"Nicht planbare Inhalte: {total-counts['planned']}")
-        print(f"Zielwurzel: {target_root}")
-        print("Beispiele (Quelle -> vorgeschlagenes Ziel):")
-        for source, dest in samples:
-            print(f"  {source}\n    -> {dest}")
-        for sha, reason in errors[:10]:
-            print(f"PROBLEM {sha}: {reason}")
-        print("HINWEIS: Dies ist nur ein Plan, keine erneute SHA-256-Prüfung und kein Kopiervorgang.")
+        print("NUR DRY-RUN: keine Dateien, Verzeichnisse oder Datenbankeinträge verändert")
+        print(f"Eindeutige Inhalte: {total}; geplante Kopien: {len(planned)}")
+        print(f"Quellen DATENSICHV: {counts['DATENSICHV']}; TV: {counts['TV']}")
+        print(f"Namenskonflikte: {len(conflicts)}; bestehende Zielpfade: {len(existing)}")
+        print(f"Datei/Verzeichnis-Konflikte: {len(hierarchy)}; Planungsfehler: {len(problems)}")
+        print(f"Ungültige Herkunftspfade: {len(invalid)}; Zielwurzel: {target_root}")
+        print("\nNAMENSKONFLIKTE:")
+        for original, first, second, resolved in conflicts:
+            print(f"  Gewünschter relativer Pfad: {original}")
+            print(f"    Erste Quelle: {first}")
+            print(f"    Weitere Quelle: {second}")
+            print(f"    Alternativer Zielpfad: {resolved}")
+        print("\nBEREITS VORHANDENE ZIELPFADE:")
+        for path in existing[:30]:
+            print(f"  {path}")
+        if len(existing) > 30:
+            print(f"  ... weitere {len(existing)-30}")
+        print("\nDATEI/VERZEICHNIS-KONFLIKTE:")
+        for path in hierarchy[:30]:
+            print(f"  {path}")
+        if len(hierarchy) > 30:
+            print(f"  ... weitere {len(hierarchy)-30}")
+        print("\nPLANUNGSFEHLER:")
+        for item in problems[:30]:
+            print(f"  {item}")
+        print("\nBEISPIELE:")
+        for sha, cid, src, dst in planned[:max(args.examples, 0)]:
+            print(f"  {src}\n    -> {dst}")
+        print("HINWEIS: Keine erneute SHA-256-Prüfung; keine Kopieraktion.")
     finally:
         con.close()
 
