@@ -113,9 +113,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--plan", type=Path, default=Path.home() / "Musiksammlung_work/musik-kopierplan.csv")
     p.add_argument("--write", action="store_true", help="Kopieren ausdrücklich aktivieren")
+    p.add_argument("--limit", type=int, help="Nur die ersten N Plan-Einträge bearbeiten (für kontrollierte Tests)")
     args = p.parse_args()
     try:
         rows = validate_plan(args.plan)
+        if args.limit is not None:
+            if args.limit < 1:
+                raise ValueError("--limit muss mindestens 1 sein")
+            rows = rows[:args.limit]
         run(rows, args.write)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"ABBRUCH: {exc}", file=sys.stderr, flush=True)
