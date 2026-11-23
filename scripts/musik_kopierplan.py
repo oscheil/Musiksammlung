@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only copy plan with detailed name conflicts and destination checks."""
 import argparse
+import csv
 from collections import Counter, defaultdict
 import os
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--database", type=Path, default=Path.home() / "Musiksammlung_work/musiksammlung.sqlite")
     ap.add_argument("--examples", type=int, default=5)
+    ap.add_argument("--export", type=Path, help="CSV-Kopierplan schreiben (nur wenn konfliktfrei planbar; bestehende Datei wird nicht überschrieben)")
     args = ap.parse_args()
     con = sqlite3.connect("file:" + str(args.database.resolve()) + "?mode=ro", uri=True)
     try:
@@ -127,6 +129,21 @@ def main():
         print("\nBEISPIELE:")
         for sha, cid, src, dst in planned[:max(args.examples, 0)]:
             print(f"  {src}\n    -> {dst}")
+        if args.export:
+            if problems or invalid or existing or hierarchy or len(planned) != total:
+                print("EXPORT ABGEBROCHEN: Planungsfehler oder vorhandene Zielkonflikte.")
+                raise SystemExit(2)
+            # Exclusive creation: never overwrite an existing plan.
+            try:
+                with args.export.open("x", encoding="utf-8", newline="") as output:
+                    writer = csv.writer(output)
+                    writer.writerow(["sha256", "quelle_aktuell", "ziel", "quellsammlung"])
+                    for sha, cid, src, dst in planned:
+                        writer.writerow([sha, str(src), str(dst), names[cid]])
+            except FileExistsError:
+                print(f"EXPORT ABGEBROCHEN: Datei existiert bereits: {args.export}")
+                raise SystemExit(2)
+            print(f"CSV-Kopierplan exportiert: {args.export} ({len(planned)} Einträge)")
         print("HINWEIS: Keine erneute SHA-256-Prüfung; keine Kopieraktion.")
     finally:
         con.close()
